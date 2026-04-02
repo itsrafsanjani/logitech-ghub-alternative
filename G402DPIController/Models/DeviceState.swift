@@ -44,11 +44,16 @@ final class DeviceState: ObservableObject {
     }
 
     func applyPreferredDPI(settings: DPISettings) async {
+        // Must switch to host mode first — the G402 boots into onboard mode
+        // and ignores DPI commands until switched. This is the root cause of
+        // the original G Hub bug (it fails to re-set host mode after wake).
+        let _ = await hidManager.switchToHostMode()
+
         let dpi = settings.preferredDPIValue
         print("[DPI] Applying preferred DPI: \(dpi)")
         let success = await hidManager.setDPI(dpi)
         if success {
-            print("[DPI] Successfully set to \(dpi)")
+            print("[DPI] Successfully set to \(hidManager.currentDPI)")
         } else {
             print("[DPI] Failed to set DPI")
         }

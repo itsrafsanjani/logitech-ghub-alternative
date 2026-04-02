@@ -8,7 +8,7 @@ enum HIDPPConstants {
     static let errorReportID: UInt8 = 0x8F
     static let shortLength = 7
     static let longLength = 20
-    static let deviceIndex: UInt8 = 0x01  // Wired USB
+    static let deviceIndex: UInt8 = 0xFF  // Direct USB (wired) — 0x01..0x06 is for Unifying receiver
     static let swID: UInt8 = 0x07
 
     // Well-known feature IDs

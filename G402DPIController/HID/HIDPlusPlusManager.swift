@@ -13,7 +13,8 @@ final class HIDPlusPlusManager: ObservableObject {
     private var reportBuffer: UnsafeMutablePointer<UInt8>?
     private let featureCache = FeatureIndexCache()
 
-    private var responseContinuation: CheckedContinuation<[UInt8]?, Never>?
+    // Response waiting — simple polling instead of continuations to avoid leaks
+    private var pendingResponse: [UInt8]?
 
     var onDeviceConnected: (() -> Void)?
 
@@ -84,7 +85,6 @@ final class HIDPlusPlusManager: ObservableObject {
         self.device = device
         self.isConnected = true
 
-        // Allocate report buffer and register callback
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: HIDPPConstants.longLength)
         self.reportBuffer = buffer
         let context = Unmanaged.passUnretained(self).toOpaque()
@@ -94,7 +94,12 @@ final class HIDPlusPlusManager: ObservableObject {
             { context, _, _, _, reportID, report, reportLength in
                 guard let context else { return }
                 let self_ = Unmanaged<HIDPlusPlusManager>.fromOpaque(context).takeUnretainedValue()
-                let bytes = [UInt8(reportID)] + Array(UnsafeBufferPointer(start: report, count: reportLength))
+                let bufferBytes = Array(UnsafeBufferPointer(start: report, count: reportLength))
+                let reportIDByte = UInt8(reportID)
+                // Buffer already contains report ID as byte[0] on multi-report devices
+                let bytes = (!bufferBytes.isEmpty && bufferBytes[0] == reportIDByte)
+                    ? bufferBytes
+                    : [reportIDByte] + bufferBytes
                 Task { @MainActor in
                     self_.handleInputReport(bytes)
                 }
@@ -123,14 +128,17 @@ final class HIDPlusPlusManager: ObservableObject {
     private func handleInputReport(_ bytes: [UInt8]) {
         guard bytes.count >= HIDPPConstants.shortLength else { return }
         let reportID = bytes[0]
-        let responseSWID = bytes[3] & 0x0F
 
-        if (reportID == HIDPPConstants.shortReportID ||
-            reportID == HIDPPConstants.longReportID ||
-            reportID == HIDPPConstants.errorReportID) &&
-            (responseSWID == HIDPPConstants.swID || reportID == HIDPPConstants.errorReportID) {
-            responseContinuation?.resume(returning: bytes)
-            responseContinuation = nil
+        guard reportID == HIDPPConstants.shortReportID ||
+              reportID == HIDPPConstants.longReportID ||
+              reportID == HIDPPConstants.errorReportID else { return }
+
+        // HID++ 2.0 error responses (featureIndex=0xFF) have swID in byte[4], not byte[3]
+        let isHIDPP2Error = bytes[2] == 0xFF
+        let responseSWID = isHIDPP2Error ? (bytes[4] & 0x0F) : (bytes[3] & 0x0F)
+
+        if responseSWID == HIDPPConstants.swID || reportID == HIDPPConstants.errorReportID {
+            pendingResponse = bytes
         }
     }
 
@@ -141,9 +149,10 @@ final class HIDPlusPlusManager: ObservableObject {
 
         let bytes = message.toBytes()
         let reportID = CFIndex(bytes[0])
-        let reportData = Array(bytes.dropFirst())
 
-        let sendResult = reportData.withUnsafeBufferPointer { buffer in
+        // Apple docs: "If the device supports multiple reports, [the reportID] should
+        // also be set in the first byte of the report." — send full buffer.
+        let sendResult = bytes.withUnsafeBufferPointer { buffer in
             IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, reportID, buffer.baseAddress!, buffer.count)
         }
 
@@ -152,18 +161,16 @@ final class HIDPlusPlusManager: ObservableObject {
             return nil
         }
 
-        // Wait for response with timeout
-        return await withCheckedContinuation { continuation in
-            self.responseContinuation = continuation
-
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(timeout))
-                if self.responseContinuation != nil {
-                    self.responseContinuation?.resume(returning: nil)
-                    self.responseContinuation = nil
-                }
-            }
+        // Poll for response — avoids CheckedContinuation leak issues
+        pendingResponse = nil
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while pendingResponse == nil && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
         }
+
+        let response = pendingResponse
+        pendingResponse = nil
+        return response
     }
 
     // MARK: - Feature Discovery
@@ -201,6 +208,39 @@ final class HIDPlusPlusManager: ObservableObject {
         return index
     }
 
+    // MARK: - Onboard Profile Mode
+
+    /// Switch the mouse to host mode so DPI can be controlled from software.
+    /// The G402 boots into onboard mode (0x02) by default, ignoring host DPI commands.
+    func switchToHostMode() async -> Bool {
+        guard let featureIndex = await discoverFeatureIndex(featureID: HIDPPConstants.onboardProfilesFeatureID) else {
+            print("[HID] Onboard Profiles feature not found — skipping mode switch")
+            return false
+        }
+
+        // func 1 = setMode, param 0x01 = host mode
+        let message = HIDPPMessage.longReport(
+            featureIndex: featureIndex,
+            functionID: 1,    // setMode
+            params: [0x01]    // 0x01 = host, 0x02 = onboard
+        )
+
+        guard let _ = await sendMessage(message) else { return false }
+
+        // Verify mode switched
+        let verify = HIDPPMessage.longReport(
+            featureIndex: featureIndex,
+            functionID: 2,    // getMode
+            params: []
+        )
+        if let response = await sendMessage(verify), response.count > 4 {
+            let mode = response[4]
+            print("[HID] Profile mode: \(mode == 1 ? "HOST" : mode == 2 ? "ONBOARD" : "0x\(String(format: "%02X", mode))")")
+            return mode == 0x01
+        }
+        return true
+    }
+
     // MARK: - DPI Operations
 
     func readDPI() async -> UInt16? {
@@ -210,13 +250,14 @@ final class HIDPlusPlusManager: ObservableObject {
 
         let message = HIDPPMessage.longReport(
             featureIndex: featureIndex,
-            functionID: 1,  // getSensorDPI
+            functionID: 2,  // getSensorDpi (func 0=count, 1=dpiList, 2=getDpi, 3=setDpi)
             params: [0]     // sensor index 0
         )
 
         guard let response = await sendMessage(message),
               response.count >= 7 else { return nil }
 
+        // Response: [reportID, deviceIdx, featIdx, func|swID, sensorIdx, dpiHi, dpiLo, ...]
         let dpi = (UInt16(response[5]) << 8) | UInt16(response[6])
         currentDPI = dpi
         return dpi
@@ -232,7 +273,7 @@ final class HIDPlusPlusManager: ObservableObject {
 
         let message = HIDPPMessage.longReport(
             featureIndex: featureIndex,
-            functionID: 2,     // setSensorDPI
+            functionID: 3,     // setSensorDpi (func 0=count, 1=dpiList, 2=getDpi, 3=setDpi)
             params: [0, hi, lo]  // sensor index 0, DPI big-endian
         )
 
@@ -243,13 +284,14 @@ final class HIDPlusPlusManager: ObservableObject {
             return false
         }
 
-        // Verify by reading back
+        // Verify by reading back (allow ±10 for hardware rounding — G402 rounds 1600→1596)
         if let actual = await readDPI() {
-            if actual != dpi {
+            let diff = abs(Int(actual) - Int(dpi))
+            if diff > 10 {
                 print("[HID] DPI mismatch: requested \(dpi), got \(actual)")
             }
             currentDPI = actual
-            return actual == dpi
+            return diff <= 10
         }
 
         currentDPI = dpi

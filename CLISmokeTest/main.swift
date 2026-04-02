@@ -17,8 +17,8 @@ let HIDPP_SHORT_REPORT_ID: UInt8 = 0x10
 let HIDPP_LONG_REPORT_ID: UInt8 = 0x11
 let HIDPP_SHORT_LENGTH = 7
 let HIDPP_LONG_LENGTH = 20
-let DEVICE_INDEX: UInt8 = 0x01
-let SW_ID: UInt8 = 0x07
+let DEVICE_INDEX: UInt8 = 0xFF  // Direct USB (wired) — 0x01..0x06 is for Unifying receiver
+let SW_ID: UInt8 = 0x07         // Software ID for matching responses
 let ADJUSTABLE_DPI_FEATURE_ID: UInt16 = 0x2201
 
 // MARK: - Mutable state (single-threaded CLI, callbacks on same run loop)
@@ -26,6 +26,7 @@ let ADJUSTABLE_DPI_FEATURE_ID: UInt16 = 0x2201
 nonisolated(unsafe) var g402Device: IOHIDDevice?
 nonisolated(unsafe) var responseReceived = false
 nonisolated(unsafe) var lastResponse = [UInt8]()
+nonisolated(unsafe) var callbackFiredCount = 0
 
 // MARK: - HID Report Helpers
 
@@ -68,25 +69,42 @@ func inputReportCallback(
     report: UnsafeMutablePointer<UInt8>,
     reportLength: CFIndex
 ) {
-    let bytes = Array(UnsafeBufferPointer(start: report, count: reportLength))
+    callbackFiredCount += 1
+    let bufferBytes = Array(UnsafeBufferPointer(start: report, count: reportLength))
+    let reportIDParam = UInt8(reportID)
 
-    if bytes.count >= 4 {
-        let responseSWID = bytes[3] & 0x0F
-        let responseReportID = UInt8(reportID)
+    // The buffer already contains the report ID as byte[0] on multi-report devices.
+    // Use the buffer directly; the reportID parameter is redundant.
+    let bytes: [UInt8]
+    if !bufferBytes.isEmpty && bufferBytes[0] == reportIDParam {
+        bytes = bufferBytes  // Buffer includes report ID
+    } else {
+        bytes = [reportIDParam] + bufferBytes  // Prepend if missing
+    }
 
-        if (responseReportID == HIDPP_SHORT_REPORT_ID ||
-            responseReportID == HIDPP_LONG_REPORT_ID ||
-            responseReportID == 0x8F) &&
-            (responseSWID == SW_ID || responseReportID == 0x8F) {
-            lastResponse = [responseReportID] + bytes
-            responseReceived = true
-        }
+    // Debug: print ALL incoming reports
+    print("  [CB#\(callbackFiredCount)] reportID=0x\(String(format: "%02X", reportIDParam)) len=\(reportLength) data=\(hexString(bytes))")
+
+    guard bytes.count >= 4 else { return }
+    let respReportID = bytes[0]
+
+    guard respReportID == HIDPP_SHORT_REPORT_ID ||
+          respReportID == HIDPP_LONG_REPORT_ID ||
+          respReportID == 0x8F else { return }
+
+    // HID++ 2.0 error responses (featureIndex=0xFF) have swID in byte[4], not byte[3]
+    let isHIDPP2Error = bytes[2] == 0xFF
+    let responseSWID = isHIDPP2Error ? (bytes[4] & 0x0F) : (bytes[3] & 0x0F)
+
+    if responseSWID == SW_ID || respReportID == 0x8F {
+        lastResponse = bytes
+        responseReceived = true
     }
 }
 
 // MARK: - Send and Wait
 
-func sendReport(_ report: [UInt8], timeout: TimeInterval = 2.0) -> [UInt8]? {
+func sendReport(_ report: [UInt8], timeout: TimeInterval = 3.0) -> [UInt8]? {
     guard let device = g402Device else {
         print("ERROR: No device")
         return nil
@@ -94,24 +112,43 @@ func sendReport(_ report: [UInt8], timeout: TimeInterval = 2.0) -> [UInt8]? {
 
     responseReceived = false
     lastResponse = []
+    callbackFiredCount = 0
 
     let reportID = CFIndex(report[0])
-    let reportData = Array(report.dropFirst())
 
     print("  TX: \(hexString(report))")
 
-    let result = reportData.withUnsafeBufferPointer { buffer in
+    // Try sending WITH report ID in buffer (Apple docs say to include it for multi-report devices)
+    let result = report.withUnsafeBufferPointer { buffer in
         IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, reportID, buffer.baseAddress!, buffer.count)
     }
 
     if result != kIOReturnSuccess {
-        print("  ERROR: IOHIDDeviceSetReport failed with 0x\(String(format: "%08X", result))")
-        return nil
+        print("  ERROR: IOHIDDeviceSetReport (with reportID in buffer) failed: 0x\(String(format: "%08X", result))")
+
+        // Fallback: try sending WITHOUT report ID in buffer
+        print("  Retrying without report ID in buffer...")
+        let reportData = Array(report.dropFirst())
+        let result2 = reportData.withUnsafeBufferPointer { buffer in
+            IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, reportID, buffer.baseAddress!, buffer.count)
+        }
+        if result2 != kIOReturnSuccess {
+            print("  ERROR: IOHIDDeviceSetReport (without reportID) also failed: 0x\(String(format: "%08X", result2))")
+            return nil
+        }
+        print("  Send succeeded without report ID in buffer")
     }
 
+    // Wait for response, pumping the run loop
     let deadline = Date().addingTimeInterval(timeout)
     while !responseReceived && Date() < deadline {
-        RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+    }
+
+    if callbackFiredCount == 0 {
+        print("  WARNING: Input report callback never fired (0 callbacks in \(timeout)s)")
+    } else {
+        print("  Callback fired \(callbackFiredCount) time(s)")
     }
 
     if responseReceived {
@@ -134,12 +171,14 @@ func discoverFeatureIndex(featureID: UInt16) -> UInt8? {
 
     guard let response = sendReport(report) else { return nil }
 
+    // Check for error response (report ID 0x8F = HID++ 1.0 error)
     if response[0] == 0x8F {
         print("  Got HID++ 1.0 error response — this device may use HID++ 1.0, not 2.0")
         print("  Error code: 0x\(String(format: "%02X", response.count > 6 ? response[6] : 0))")
         return nil
     }
 
+    // Check for HID++ 2.0 error (feature index 0xFF with error)
     if response.count > 4 && response[4] == 0x00 && response.count > 5 && response[5] == 0x00 {
         print("  Feature 0x\(String(format: "%04X", featureID)) not found on this device")
         return nil
@@ -153,7 +192,7 @@ func discoverFeatureIndex(featureID: UInt16) -> UInt8? {
 
 func getSensorDPI(featureIndex: UInt8, sensorIndex: UInt8 = 0) -> UInt16? {
     print("\n--- Reading current DPI (sensor \(sensorIndex)) ---")
-    let report = makeLongReport(featureIndex: featureIndex, functionID: 1, params: [sensorIndex])
+    let report = makeLongReport(featureIndex: featureIndex, functionID: 2, params: [sensorIndex])  // func 2 = getSensorDpi
 
     guard let response = sendReport(report) else { return nil }
 
@@ -170,7 +209,7 @@ func setSensorDPI(featureIndex: UInt8, sensorIndex: UInt8 = 0, dpi: UInt16) -> B
     print("\n--- Setting DPI to \(dpi) (sensor \(sensorIndex)) ---")
     let hi = UInt8((dpi >> 8) & 0xFF)
     let lo = UInt8(dpi & 0xFF)
-    let report = makeLongReport(featureIndex: featureIndex, functionID: 2, params: [sensorIndex, hi, lo])
+    let report = makeLongReport(featureIndex: featureIndex, functionID: 3, params: [sensorIndex, hi, lo])  // func 3 = setSensorDpi
 
     guard let response = sendReport(report) else { return false }
 
@@ -202,12 +241,14 @@ func getSensorCount(featureIndex: UInt8) -> UInt8? {
 print("=== G402 DPI Controller - CLI Smoke Test ===")
 print("Looking for Logitech G402 (VID=0x\(String(format: "%04X", LOGITECH_VID)), PID=0x\(String(format: "%04X", G402_PID)))...")
 
+// Create HID Manager
 let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
+// Match dictionary: G402 HID++ interface (PrimaryUsage=6)
 let matchDict: [String: Any] = [
     kIOHIDVendorIDKey as String: LOGITECH_VID,
     kIOHIDProductIDKey as String: G402_PID,
-    kIOHIDPrimaryUsageKey as String: 6
+    kIOHIDPrimaryUsageKey as String: 6  // Keyboard/HID++ control interface
 ]
 
 IOHIDManagerSetDeviceMatching(manager, matchDict as CFDictionary)
@@ -220,8 +261,10 @@ if openResult != kIOReturnSuccess {
     exit(1)
 }
 
+// Get matching devices
 guard let deviceSet = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
     print("ERROR: No devices found. Is the G402 plugged in?")
+    print("Check: ioreg -p IOUSB | grep G402")
     exit(1)
 }
 
@@ -234,6 +277,21 @@ guard let device = deviceSet.first else {
 
 g402Device = device
 
+// Print device properties for debugging
+func getDeviceProperty(_ device: IOHIDDevice, _ key: String) -> Any? {
+    IOHIDDeviceGetProperty(device, key as CFString)
+}
+print("\nDevice properties:")
+print("  Product:          \(getDeviceProperty(device, kIOHIDProductKey) ?? "?")")
+print("  VendorID:         \(getDeviceProperty(device, kIOHIDVendorIDKey) ?? "?")")
+print("  ProductID:        \(getDeviceProperty(device, kIOHIDProductIDKey) ?? "?")")
+print("  PrimaryUsage:     \(getDeviceProperty(device, kIOHIDPrimaryUsageKey) ?? "?")")
+print("  PrimaryUsagePage: \(getDeviceProperty(device, kIOHIDPrimaryUsagePageKey) ?? "?")")
+print("  MaxInputReport:   \(getDeviceProperty(device, kIOHIDMaxInputReportSizeKey) ?? "?")")
+print("  MaxOutputReport:  \(getDeviceProperty(device, kIOHIDMaxOutputReportSizeKey) ?? "?")")
+print("  Transport:        \(getDeviceProperty(device, kIOHIDTransportKey) ?? "?")")
+
+// Open the device
 let deviceOpenResult = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
 if deviceOpenResult != kIOReturnSuccess {
     print("ERROR: Failed to open device (0x\(String(format: "%08X", deviceOpenResult)))")
@@ -245,39 +303,71 @@ if deviceOpenResult != kIOReturnSuccess {
     exit(1)
 }
 
-print("Device opened successfully")
+print("\nDevice opened successfully")
 
+// Explicitly schedule device on current run loop (belt and suspenders)
+IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+
+// Register input report callback
 let reportBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: HIDPP_LONG_LENGTH)
 IOHIDDeviceRegisterInputReportCallback(device, reportBuffer, HIDPP_LONG_LENGTH, inputReportCallback, nil)
 
-// Step 1: Discover feature index for Adjustable DPI (0x2201)
+// First, pump the run loop briefly to process any pending events
+print("\nWaiting 0.5s for device initialization...")
+let initDeadline = Date().addingTimeInterval(0.5)
+while Date() < initDeadline {
+    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+}
+if callbackFiredCount > 0 {
+    print("Received \(callbackFiredCount) unsolicited report(s) during init")
+    callbackFiredCount = 0
+}
+
+// Step 1: Discover feature indices
 guard let dpiFeatureIndex = discoverFeatureIndex(featureID: ADJUSTABLE_DPI_FEATURE_ID) else {
     print("\nFATAL: Could not discover Adjustable DPI feature.")
-    print("The G402 may use HID++ 1.0. Try register-based protocol instead.")
-
-    print("\n--- Attempting HID++ 1.0 fallback (register 0x63) ---")
-    let fallbackReport = makeShortReport(featureIndex: 0x00, functionID: 0x08, params: [0x63, 0x00, 0x00])
-    if let response = sendReport(fallbackReport) {
-        print("  HID++ 1.0 response: \(hexString(response))")
-    }
-
     reportBuffer.deallocate()
     exit(1)
 }
 
-// Step 2: Get sensor count
+let profileFeatureIndex = discoverFeatureIndex(featureID: 0x8100)  // Onboard Profiles
+
+// Step 2: Check current onboard profile mode
+if let profIdx = profileFeatureIndex {
+    print("\n--- Reading current profile mode (feature 0x8100, func 2 = getMode) ---")
+    let getModeReport = makeLongReport(featureIndex: profIdx, functionID: 2, params: [])
+    if let response = sendReport(getModeReport) {
+        let mode = response.count > 4 ? response[4] : 0xFF
+        print("  Current mode: 0x\(String(format: "%02X", mode)) (\(mode == 1 ? "HOST" : mode == 2 ? "ONBOARD" : "UNKNOWN"))")
+    }
+
+    // Step 3: Switch to HOST mode so we can control DPI from software
+    print("\n--- Switching to HOST mode (feature 0x8100, func 1 = setMode, param 0x01) ---")
+    let setModeReport = makeLongReport(featureIndex: profIdx, functionID: 1, params: [0x01])
+    if let response = sendReport(setModeReport) {
+        let newMode = response.count > 4 ? response[4] : 0xFF
+        print("  Mode after set: 0x\(String(format: "%02X", newMode)) (\(newMode == 1 ? "HOST" : newMode == 2 ? "ONBOARD" : "UNKNOWN"))")
+    }
+} else {
+    print("\n  Onboard Profiles feature not found — skipping mode switch")
+}
+
+// Step 4: Get sensor count
 let _ = getSensorCount(featureIndex: dpiFeatureIndex)
 
-// Step 3: Read current DPI
+// Step 5: Read current DPI
 let currentDPI = getSensorDPI(featureIndex: dpiFeatureIndex, sensorIndex: 0)
 print("\n  >>> Current DPI: \(currentDPI.map { String($0) } ?? "unknown")")
 
-// Step 4: Set DPI to 1600
+// Step 6: Set DPI to 1600
 let targetDPI: UInt16 = 1600
 if setSensorDPI(featureIndex: dpiFeatureIndex, sensorIndex: 0, dpi: targetDPI) {
+    // Step 7: Read back to verify
     if let newDPI = getSensorDPI(featureIndex: dpiFeatureIndex, sensorIndex: 0) {
-        if newDPI == targetDPI {
-            print("\n=== SUCCESS: DPI set to \(targetDPI) and verified ===")
+        // Allow small rounding (mouse may round to nearest hardware step)
+        let diff = abs(Int(newDPI) - Int(targetDPI))
+        if diff <= 10 {
+            print("\n=== SUCCESS: DPI set to \(newDPI) (requested \(targetDPI)) ===")
         } else {
             print("\n=== WARNING: DPI readback mismatch — set \(targetDPI) but read \(newDPI) ===")
         }
@@ -286,15 +376,17 @@ if setSensorDPI(featureIndex: dpiFeatureIndex, sensorIndex: 0, dpi: targetDPI) {
     print("\n=== FAILED: Could not set DPI ===")
 }
 
-// Check for onboard profiles feature (0x8100)
-print("\n--- Checking for Onboard Profiles feature (0x8100) ---")
-if let profileFeatureIndex = discoverFeatureIndex(featureID: 0x8100) {
-    print("  Onboard Profiles feature found at index \(profileFeatureIndex)")
-    print("  This means we can switch between host/onboard mode")
-} else {
-    print("  Onboard Profiles feature not found — will rely on re-sending DPI on wake")
+// Step 8: Verify mode is still host
+if let profIdx = profileFeatureIndex {
+    print("\n--- Verifying profile mode after DPI set ---")
+    let getModeReport = makeLongReport(featureIndex: profIdx, functionID: 2, params: [])
+    if let response = sendReport(getModeReport) {
+        let mode = response.count > 4 ? response[4] : 0xFF
+        print("  Mode: 0x\(String(format: "%02X", mode)) (\(mode == 1 ? "HOST" : mode == 2 ? "ONBOARD" : "UNKNOWN"))")
+    }
 }
 
+// Cleanup
 IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
 reportBuffer.deallocate()
 
