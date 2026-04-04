@@ -2,6 +2,11 @@
 
 A lightweight SwiftUI menu bar app that controls DPI on the Logitech G402 Hyperion Fury mouse. Replaces Logitech G Hub (~200MB Electron app) with a <1MB native macOS app.
 
+## Preview
+
+<img width="1122" height="1105" alt="CleanShot 2026-04-04 at 14 07 24@2x" src="https://github.com/user-attachments/assets/374e2149-76fc-46f4-a335-692598f47799" />
+
+
 ## Why
 
 Logitech G Hub has a bug where mouse DPI resets to the onboard default after screen lock/unlock. The root cause: the G402 boots into **onboard mode** on every USB re-enumeration (which happens during sleep/wake), and G Hub's `onDpiRestoreTuning` fails to switch back to **host mode**.
