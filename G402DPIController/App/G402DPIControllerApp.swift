@@ -12,8 +12,8 @@ struct G402DPIControllerApp: App {
                     deviceState.start(settings: settings)
                 }
         } label: {
-            if deviceState.isConnected && deviceState.currentDPI > 0 {
-                Text("DPI: \(deviceState.currentDPI)")
+            if deviceState.isConnected && deviceState.displayDPI > 0 {
+                Text("DPI: \(deviceState.displayDPI)")
                     .monospacedDigit()
             } else {
                 Image(systemName: "computermouse")

@@ -1,0 +1,44 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:G402DPIController}",
+      "name": "Debug G402DPIController",
+      "target": "G402DPIController",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug G402DPIController"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:G402DPIController}",
+      "name": "Release G402DPIController",
+      "target": "G402DPIController",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release G402DPIController"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:G402DPIController}",
+      "name": "Debug CLISmokeTest",
+      "target": "CLISmokeTest",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug CLISmokeTest"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:G402DPIController}",
+      "name": "Release CLISmokeTest",
+      "target": "CLISmokeTest",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release CLISmokeTest"
+    }
+  ]
+}

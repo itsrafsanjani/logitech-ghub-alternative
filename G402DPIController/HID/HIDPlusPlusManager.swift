@@ -7,6 +7,7 @@ import Combine
 final class HIDPlusPlusManager: ObservableObject {
     @Published private(set) var isConnected = false
     @Published private(set) var currentDPI: UInt16 = 0
+    @Published private(set) var sensorCapabilities: SensorDPICapabilities?
 
     private var hidManager: IOHIDManager?
     private var device: IOHIDDevice?
@@ -120,6 +121,7 @@ final class HIDPlusPlusManager: ObservableObject {
         device = nil
         isConnected = false
         currentDPI = 0
+        sensorCapabilities = nil
         reportBuffer?.deallocate()
         reportBuffer = nil
         print("[HID] G402 disconnected")
@@ -243,6 +245,37 @@ final class HIDPlusPlusManager: ObservableObject {
 
     // MARK: - DPI Operations
 
+    func getSensorDpiList() async -> SensorDPICapabilities? {
+        guard let featureIndex = await discoverFeatureIndex(featureID: HIDPPConstants.adjustableDPIFeatureID) else {
+            return nil
+        }
+
+        let message = HIDPPMessage.longReport(
+            featureIndex: featureIndex,
+            functionID: 1,  // getSensorDpiList
+            params: [0]     // sensor index 0
+        )
+
+        guard let response = await sendMessage(message),
+              response.count >= 7 else { return nil }
+
+        if response[0] == HIDPPConstants.errorReportID {
+            print("[HID] getSensorDpiList failed — error response")
+            return nil
+        }
+
+        // Byte 4 = sensorIdx, DPI list starts at byte 5
+        let payload = Array(response[5...])
+        let caps = SensorDPICapabilities.parse(payload: payload)
+
+        if let caps {
+            sensorCapabilities = caps
+            print("[HID] Sensor DPI: min=\(caps.minDPI) max=\(caps.maxDPI) step=\(caps.step) (\(caps.validDPIs.count) values)")
+        }
+
+        return caps
+    }
+
     func readDPI() async -> UInt16? {
         guard let featureIndex = await discoverFeatureIndex(featureID: HIDPPConstants.adjustableDPIFeatureID) else {
             return nil
@@ -284,14 +317,15 @@ final class HIDPlusPlusManager: ObservableObject {
             return false
         }
 
-        // Verify by reading back (allow ±10 for hardware rounding — G402 rounds 1600→1596)
+        // Verify by reading back (allow tolerance based on hardware step size)
         if let actual = await readDPI() {
             let diff = abs(Int(actual) - Int(dpi))
-            if diff > 10 {
+            let tolerance = Int(sensorCapabilities?.step ?? 50)
+            if diff > tolerance {
                 print("[HID] DPI mismatch: requested \(dpi), got \(actual)")
             }
             currentDPI = actual
-            return diff <= 10
+            return diff <= tolerance
         }
 
         currentDPI = dpi

@@ -236,6 +236,115 @@ func getSensorCount(featureIndex: UInt8) -> UInt8? {
     return nil
 }
 
+// MARK: - DPI Capabilities (mirrors SensorDPICapabilities in main app)
+
+struct DPICapabilities {
+    let validDPIs: [UInt16]
+    let minDPI: UInt16
+    let maxDPI: UInt16
+    let step: UInt16
+
+    func snap(_ requested: UInt16) -> UInt16 {
+        let clamped = min(max(requested, minDPI), maxDPI)
+        var best = validDPIs[0]
+        var bestDiff = abs(Int(clamped) - Int(best))
+        for dpi in validDPIs {
+            let diff = abs(Int(clamped) - Int(dpi))
+            if diff < bestDiff {
+                best = dpi
+                bestDiff = diff
+            }
+        }
+        return best
+    }
+}
+
+func getSensorDpiList(featureIndex: UInt8, sensorIndex: UInt8 = 0) -> DPICapabilities? {
+    print("\n--- Reading sensor DPI list (sensor \(sensorIndex)) ---")
+    let report = makeLongReport(featureIndex: featureIndex, functionID: 1, params: [sensorIndex])
+
+    guard let response = sendReport(report) else { return nil }
+
+    if response[0] == 0x8F {
+        print("  ERROR: getSensorDpiList failed with error")
+        return nil
+    }
+
+    // Byte 4 = sensorIdx, DPI list starts at byte 5
+    let payload = Array(response[5...])
+
+    // Read 16-bit big-endian entries until 0x0000 terminator
+    var entries: [UInt16] = []
+    var i = 0
+    while i + 1 < payload.count {
+        let value = (UInt16(payload[i]) << 8) | UInt16(payload[i + 1])
+        if value == 0x0000 { break }
+        entries.append(value)
+        i += 2
+    }
+
+    print("  Raw entries: \(entries.map { String(format: "0x%04X", $0) }.joined(separator: ", "))")
+
+    guard !entries.isEmpty else {
+        print("  ERROR: No entries in DPI list")
+        return nil
+    }
+
+    // Expand entries into flat list of valid DPIs
+    // 0xE0xx (bits 15-13 = 111) = step marker for range between surrounding values
+    var validDPIs: [UInt16] = []
+    var idx = 0
+    while idx < entries.count {
+        let val = entries[idx]
+        if idx + 1 < entries.count && (entries[idx + 1] & 0xE000) == 0xE000 {
+            let stepSize = entries[idx + 1] & 0x1FFF
+            let rangeStart = val
+            guard idx + 2 < entries.count else {
+                validDPIs.append(rangeStart)
+                break
+            }
+            let rangeEnd = entries[idx + 2]
+            print("  Range: \(rangeStart) to \(rangeEnd) step \(stepSize)")
+            if stepSize > 0 {
+                var d = rangeStart
+                while d <= rangeEnd {
+                    validDPIs.append(d)
+                    d += stepSize
+                }
+            } else {
+                validDPIs.append(rangeStart)
+                validDPIs.append(rangeEnd)
+            }
+            idx += 3
+        } else {
+            validDPIs.append(val)
+            idx += 1
+        }
+    }
+
+    guard !validDPIs.isEmpty else {
+        print("  ERROR: Could not expand DPI list")
+        return nil
+    }
+
+    validDPIs = Array(Set(validDPIs)).sorted()
+
+    let minDPI = validDPIs.first!
+    let maxDPI = validDPIs.last!
+    var smallestStep: UInt16 = maxDPI - minDPI
+    for j in 1..<validDPIs.count {
+        let diff = validDPIs[j] - validDPIs[j - 1]
+        if diff > 0 && diff < smallestStep {
+            smallestStep = diff
+        }
+    }
+
+    print("  Sensor DPI: min=\(minDPI) max=\(maxDPI) step=\(smallestStep) (\(validDPIs.count) values)")
+    print("  All valid DPIs: \(validDPIs)")
+
+    return DPICapabilities(validDPIs: validDPIs, minDPI: minDPI, maxDPI: maxDPI, step: smallestStep)
+}
+
 // MARK: - Main
 
 print("=== G402 DPI Controller - CLI Smoke Test ===")
@@ -355,28 +464,45 @@ if let profIdx = profileFeatureIndex {
 // Step 4: Get sensor count
 let _ = getSensorCount(featureIndex: dpiFeatureIndex)
 
-// Step 5: Read current DPI
+// Step 5: Query sensor DPI list (hardware capabilities)
+let capabilities = getSensorDpiList(featureIndex: dpiFeatureIndex, sensorIndex: 0)
+
+// Step 6: Read current DPI
 let currentDPI = getSensorDPI(featureIndex: dpiFeatureIndex, sensorIndex: 0)
 print("\n  >>> Current DPI: \(currentDPI.map { String($0) } ?? "unknown")")
 
-// Step 6: Set DPI to 1600
-let targetDPI: UInt16 = 1600
+// Step 7: Set DPI to 1600 (snapped to nearest valid hardware DPI)
+let requestedDPI: UInt16 = 1600
+let targetDPI: UInt16 = capabilities?.snap(requestedDPI) ?? requestedDPI
+if targetDPI != requestedDPI {
+    print("\n  Snapped \(requestedDPI) → \(targetDPI) (nearest valid hardware DPI)")
+}
+
 if setSensorDPI(featureIndex: dpiFeatureIndex, sensorIndex: 0, dpi: targetDPI) {
-    // Step 7: Read back to verify
+    // Step 8: Read back to verify
     if let newDPI = getSensorDPI(featureIndex: dpiFeatureIndex, sensorIndex: 0) {
-        // Allow small rounding (mouse may round to nearest hardware step)
         let diff = abs(Int(newDPI) - Int(targetDPI))
-        if diff <= 10 {
-            print("\n=== SUCCESS: DPI set to \(newDPI) (requested \(targetDPI)) ===")
+        let tolerance = Int(capabilities?.step ?? 50)
+        if diff <= tolerance {
+            print("\n=== SUCCESS: DPI set to \(newDPI) (requested \(requestedDPI), snapped to \(targetDPI)) ===")
         } else {
-            print("\n=== WARNING: DPI readback mismatch — set \(targetDPI) but read \(newDPI) ===")
+            print("\n=== WARNING: DPI readback mismatch — sent \(targetDPI) but read \(newDPI) (tolerance: \(tolerance)) ===")
         }
     }
 } else {
     print("\n=== FAILED: Could not set DPI ===")
 }
 
-// Step 8: Verify mode is still host
+// Step 9: Test all presets (snap and report)
+if let caps = capabilities {
+    print("\n--- Preset DPI snapping ---")
+    for preset: UInt16 in [400, 800, 1200, 1600, 3200] {
+        let snapped = caps.snap(preset)
+        print("  \(preset) → \(snapped)")
+    }
+}
+
+// Step 10: Verify mode is still host
 if let profIdx = profileFeatureIndex {
     print("\n--- Verifying profile mode after DPI set ---")
     let getModeReport = makeLongReport(featureIndex: profIdx, functionID: 2, params: [])

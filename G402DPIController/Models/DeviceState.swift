@@ -8,6 +8,8 @@ final class DeviceState: ObservableObject {
 
     @Published var isConnected = false
     @Published var currentDPI: UInt16 = 0
+    @Published var displayDPI: UInt16 = 0  // User-friendly value shown in UI
+    @Published var sensorCapabilities: SensorDPICapabilities?
 
     private var cancellables = Set<AnyCancellable>()
     private var started = false
@@ -23,6 +25,10 @@ final class DeviceState: ObservableObject {
         hidManager.$currentDPI
             .receive(on: DispatchQueue.main)
             .assign(to: &$currentDPI)
+
+        hidManager.$sensorCapabilities
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$sensorCapabilities)
 
         // On device connect: apply preferred DPI
         hidManager.onDeviceConnected = { [weak self] in
@@ -49,10 +55,16 @@ final class DeviceState: ObservableObject {
         // the original G Hub bug (it fails to re-set host mode after wake).
         let _ = await hidManager.switchToHostMode()
 
-        let dpi = settings.preferredDPIValue
-        print("[DPI] Applying preferred DPI: \(dpi)")
-        let success = await hidManager.setDPI(dpi)
+        // Query hardware DPI capabilities (best-effort; fallback to hardcoded)
+        let _ = await hidManager.getSensorDpiList()
+
+        let caps = hidManager.sensorCapabilities ?? G402DPI.fallbackCapabilities
+        let requestedDPI = settings.preferredDPIValue
+        let snappedDPI = caps.snap(requestedDPI)
+        print("[DPI] Applying preferred DPI: \(requestedDPI) → snapped to \(snappedDPI)")
+        let success = await hidManager.setDPI(snappedDPI)
         if success {
+            displayDPI = requestedDPI
             print("[DPI] Successfully set to \(hidManager.currentDPI)")
         } else {
             print("[DPI] Failed to set DPI")
@@ -61,6 +73,11 @@ final class DeviceState: ObservableObject {
 
     func setDPI(_ dpi: UInt16, settings: DPISettings) async {
         settings.preferredDPIValue = dpi
-        let _ = await hidManager.setDPI(dpi)
+        let caps = hidManager.sensorCapabilities ?? G402DPI.fallbackCapabilities
+        let snapped = caps.snap(dpi)
+        let success = await hidManager.setDPI(snapped)
+        if success {
+            displayDPI = dpi
+        }
     }
 }

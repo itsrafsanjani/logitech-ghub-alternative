@@ -22,7 +22,7 @@ struct DPIMenuView: View {
                 HStack {
                     Text("Current DPI:")
                     Spacer()
-                    Text("\(deviceState.currentDPI)")
+                    Text("\(deviceState.displayDPI)")
                         .monospacedDigit()
                         .fontWeight(.semibold)
                 }
@@ -43,7 +43,7 @@ struct DPIMenuView: View {
                             }
                         }
                         .buttonStyle(.bordered)
-                        .tint(deviceState.currentDPI == preset ? .accentColor : nil)
+                        .tint(isPresetActive(preset) ? .accentColor : nil)
                     }
                 }
 
@@ -55,24 +55,25 @@ struct DPIMenuView: View {
                     .foregroundStyle(.secondary)
 
                 HStack {
-                    Text("\(Int(G402DPI.minDPI))")
+                    Text("\(Int(sliderMin))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Slider(
                         value: $sliderDPI,
-                        in: Double(G402DPI.minDPI)...Double(G402DPI.maxDPI),
-                        step: Double(G402DPI.step)
+                        in: Double(sliderMin)...Double(sliderMax),
+                        step: Double(sliderStep)
                     ) {
                         Text("DPI")
                     } onEditingChanged: { editing in
                         if !editing {
-                            let dpi = G402DPI.clamp(UInt16(sliderDPI))
+                            let caps = deviceState.sensorCapabilities ?? G402DPI.fallbackCapabilities
+                            let dpi = caps.snap(UInt16(sliderDPI))
                             Task {
                                 await deviceState.setDPI(dpi, settings: settings)
                             }
                         }
                     }
-                    Text("\(Int(G402DPI.maxDPI))")
+                    Text("\(Int(sliderMax))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -101,10 +102,28 @@ struct DPIMenuView: View {
         .onAppear {
             sliderDPI = Double(settings.preferredDPI)
         }
-        .onChange(of: deviceState.currentDPI) { _, newValue in
+        .onChange(of: deviceState.displayDPI) { _, newValue in
             if newValue > 0 {
                 sliderDPI = Double(newValue)
             }
         }
+    }
+
+    // MARK: - Helpers
+
+    private var sliderMin: UInt16 {
+        deviceState.sensorCapabilities?.minDPI ?? G402DPI.minDPI
+    }
+
+    private var sliderMax: UInt16 {
+        deviceState.sensorCapabilities?.maxDPI ?? G402DPI.maxDPI
+    }
+
+    private var sliderStep: UInt16 {
+        deviceState.sensorCapabilities?.step ?? G402DPI.step
+    }
+
+    private func isPresetActive(_ preset: UInt16) -> Bool {
+        deviceState.isConnected && deviceState.displayDPI == preset
     }
 }
