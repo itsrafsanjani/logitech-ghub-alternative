@@ -47,12 +47,12 @@ To get a dock-less menu bar app with proper icon:
 swift build -c release
 
 # Create app bundle
-mkdir -p ~/Applications/G402DPIController.app/Contents/MacOS
-cp .build/release/G402DPIController ~/Applications/G402DPIController.app/Contents/MacOS/
-cp G402DPIController/App/Info.plist ~/Applications/G402DPIController.app/Contents/
+mkdir -p /Applications/G402DPIController.app/Contents/MacOS
+cp -f .build/release/G402DPIController /Applications/G402DPIController.app/Contents/MacOS/
+cp -f G402DPIController/App/Info.plist /Applications/G402DPIController.app/Contents/
 ```
 
-Then open `~/Applications/G402DPIController.app`.
+Then open `/Applications/G402DPIController.app`.
 
 ## Permissions
 

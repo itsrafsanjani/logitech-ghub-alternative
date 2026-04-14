@@ -12,12 +12,7 @@ struct G402DPIControllerApp: App {
                     deviceState.start(settings: settings)
                 }
         } label: {
-            if deviceState.isConnected && deviceState.displayDPI > 0 {
-                Text("DPI: \(deviceState.displayDPI)")
-                    .monospacedDigit()
-            } else {
-                Image(systemName: "computermouse")
-            }
+            Image(systemName: deviceState.isConnected ? "computermouse.fill" : "computermouse")
         }
         .menuBarExtraStyle(.window)
     }
